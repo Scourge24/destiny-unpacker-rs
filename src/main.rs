@@ -4,7 +4,7 @@ use utils::*;
 use structs::*;
 extern crate getopts;
 use getopts::Options;
-use std::{thread, process::{Command}, fs, env, io::SeekFrom, io::BufWriter, io::BufReader, io::prelude::*, fs::File};
+use std::{thread, process::{Command}, fs, env, io::SeekFrom, io::BufWriter, io::BufReader, io::prelude::*, fs::File, sync::{Arc, Mutex}, collections::HashSet};
 use openssl::{cipher::Cipher, cipher_ctx::CipherCtx};
 
 const BLOCK_SIZE: u32 = 262144;
@@ -16,11 +16,22 @@ fn print_usage(program: &str, opts: Options) {
 
 fn main()
 {
+    tokio::runtime::Builder::new_multi_thread()
+    .enable_all()
+    .build()
+    .unwrap()
+    .block_on(async {
+        async_main().await
+    })
+}
+
+async fn async_main()
+{
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
     let mut opts = Options::new();
     opts.reqopt("p", "", "Packages Path", "PATH");
-    opts.reqopt("i", "", "Package ID", "ID");
+    //opts.reqopt("i", "", "Package ID", "ID");
     opts.optopt("o", "", "Output Path", "PATH");
     opts.optflag("n", "nonaudio", "Does NOT skip non-audio related files");
     opts.optflag("h", "hexid", "Exports .WEMs as hexidecimal IDs");
@@ -32,13 +43,14 @@ fn main()
     };
 
     let pkgspath = matches.opt_str("p").unwrap();
-    let pkgid = matches.opt_str("i").unwrap();
-    let mut _output_path_base:String = String::new();
+    //let pkgid = matches.opt_str("i").unwrap();
+    let output_path = if matches.opt_present("o") { matches.opt_str("o").unwrap()} else {format!("{}/output", env::current_dir().unwrap().display())};
+    let mut _output_path_base = String::new();
     if matches.opt_present("o") {
         _output_path_base = matches.opt_str("o").unwrap();
     }
     else {
-        _output_path_base = format!("{}/output/{}", env::current_dir().unwrap().display(), pkgid);
+        _output_path_base = format!("{}/output", env::current_dir().unwrap().display());
     }
 
     let mut skip_non_audio:bool = true;
@@ -54,19 +66,78 @@ fn main()
     if matches.opt_present("w") {
         wavconv = true
     }
-    let extr_opts:ExtrOpts = ExtrOpts {
+    let extr_opts = Arc::new(ExtrOpts {
         skip_non_audio,
         hexid,
         wavconv,
-    };
+        output_path
+    });
 
-    let mut package = Package::new(pkgspath, pkgid);
-    read_header(&mut package);
-    modify_nonce(&mut package);
-    read_entry_table(&mut package);
-    read_block_table(&mut package);
-    extract_files(package, _output_path_base, extr_opts);
-    println!("Done extracting.");
+    let mut completed_ids = HashSet::new();
+    let mut extract_tasks = Vec::new();
+    let finished_extraction_count = Arc::new(std::sync::Mutex::new(0));
+    let sem = Arc::new(tokio::sync::Semaphore::new(100));
+
+    for i in fs::read_dir(&pkgspath).unwrap()
+    {
+        let filename = i.unwrap().path().file_stem().unwrap().to_str().unwrap().to_owned();
+        let pkg_id_str = &filename[filename.len() - 6..filename.len() - 2];
+        if completed_ids.contains(pkg_id_str)
+        {
+            continue;
+        }
+        completed_ids.insert(pkg_id_str.to_owned());
+
+        if i64::from_str_radix(pkg_id_str, 16).is_err()
+        {
+            continue;
+        }
+
+        let extr_opts = extr_opts.clone();
+        let pkgspath = pkgspath.clone();
+        let pkg_id_str = pkg_id_str.to_owned();
+        let finished_extraction_count = finished_extraction_count.clone();
+        
+        println!("Submitting extraction task for {}", &filename);
+        extract_tasks.push(tokio::spawn(do_extraction(sem.clone(), filename, pkgspath, pkg_id_str, extr_opts, finished_extraction_count)));
+    }
+
+    futures::future::join_all(extract_tasks).await;
+}
+
+async fn do_extraction(sem: Arc<tokio::sync::Semaphore>, filename: String, pkgspath: String, pkg_id_str: String, extr_opts: Arc<ExtrOpts>, finished_extraction_count : Arc<Mutex<i32>>)
+{
+    println!("Queuing parsing task for {}.", &filename[..&filename.len() - 2]);
+    let movable_filename = filename.clone();
+    let returned_package = tokio::task::spawn_blocking(move ||
+    {
+        let filename = movable_filename;
+        println!("Started parsing {}.", &filename[..&filename.len() - 2]);
+        let mut package = Package::new(&pkgspath, &pkg_id_str);
+        read_header(&mut package);
+        modify_nonce(&mut package);
+        read_entry_table(&mut package);
+        read_block_table(&mut package);
+        println!("Done parsing {}.", &filename[..&filename.len() - 2]);
+        package
+    }).await.unwrap();
+
+    {
+        println!("Acquiring permit to start extraction of {}.", &filename[..&filename.len() - 2]);
+        let permit = sem.acquire().await.unwrap();
+        println!("Starting extraction of {}.", &filename[..&filename.len() - 2]);
+        tokio::task::spawn_blocking(||
+            {
+                extract_files(returned_package, extr_opts);
+            }
+        ).await.unwrap();
+
+        drop(permit);
+    }
+
+    let mut count = finished_extraction_count.lock().unwrap();
+    *count += 1;
+    println!("Done extracting {} ({}).", &filename[..&filename.len() - 2], count);
 }
 
 pub fn read_header(package: &mut structs::Package) -> bool
@@ -193,9 +264,8 @@ fn modify_nonce(package: &mut structs::Package)
     package.nonce[11] ^= package.header.pkgid as u8;
 }
 
-fn extract_files(package: structs::Package, output_path_base: String, extr_opts: ExtrOpts)
+fn extract_files(package: structs::Package, extr_opts: Arc<structs::ExtrOpts>)
 {
-    let output_path = output_path_base.clone();
     let mut pkg_patch_stream_paths: Vec<String> = Vec::new();
     for i in 0..=package.header.patchid
     {
@@ -206,121 +276,143 @@ fn extract_files(package: structs::Package, output_path_base: String, extr_opts:
         b.insert(pkg_patch_path.len()-5, a as char);
         pkg_patch_stream_paths.push(b.to_string());
     }
-    let thread = thread::spawn(move || {
-        for i in 0..package.entries.len()
-        {
-            let entry = &package.entries[i];
+
+    //let package = Arc::new(package);
+    let pkg_patch_stream_paths = Arc::new(pkg_patch_stream_paths);
+    //let mut tasks = Vec::new();
+
+    let mut cipher_ctx = CipherCtx::new().unwrap();
+
+    for i in 0..package.entries.len()
+    {
+        //let extr_opts = extr_opts.clone();
+        //let package = package.clone();
+        let entry = &package.entries[i];
+        //let pkg_patch_stream_paths = pkg_patch_stream_paths.clone();
             
-            if extr_opts.skip_non_audio && !(entry.numtype == 26 && (entry.numsubtype == 6 || entry.numsubtype == 7)) {
-                continue;
-            }
+        if extr_opts.skip_non_audio && !(entry.numtype == 26 && (entry.numsubtype == 6 || entry.numsubtype == 7)) {
+            continue;
+        }
 
-            let mut cur_block_id = entry.startingblock;
-            let mut block_count:u32 = libm::floorf((entry.startingblockoffset as f32 + entry.filesize as f32 - 1.0_f32) / BLOCK_SIZE as f32) as u32;
-            if entry.filesize == 0
+        /*
+        let task = tokio::task::spawn(async move
+        {
+        */
+        let entry = &package.entries[i];
+        let mut cur_block_id = entry.startingblock;
+        let mut block_count:u32 = libm::floorf((entry.startingblockoffset as f32 + entry.filesize as f32 - 1.0_f32) / BLOCK_SIZE as f32) as u32;
+        if entry.filesize == 0
+        {
+            block_count = 0;
+        }
+        let last_block_id = cur_block_id + block_count;
+        let mut file_buffer = vec![0u8; entry.filesize as usize];
+        let mut current_buffer_offset = 0;
+        while cur_block_id <= last_block_id
+        {
+            let current_block = &package.blocks[cur_block_id as usize];
+            let file = File::open(&pkg_patch_stream_paths[current_block.patchid as usize]).expect("Error reading file");
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(current_block.offset as u64)).expect("Error seeking");
+            let mut block_buffer = vec![0; current_block.size as usize];
+            let result = reader.read(&mut block_buffer).expect("Error reading file");
+            if result != current_block.size as usize
             {
-                block_count = 0;
+                println!("Error reading file");
             }
-            let last_block_id = cur_block_id + block_count;
-            let mut file_buffer = vec![0u8; entry.filesize as usize];
-            let mut current_buffer_offset = 0;
-            while cur_block_id <= last_block_id
+            let mut _decrypt_buffer:Vec<u8> = vec![0u8; current_block.size as usize];
+            let mut _decomp_buffer:Vec<u8> = vec![0u8; BLOCK_SIZE as usize];
+            if current_block.bitflag & 0x2 != 0
             {
-                let current_block = &package.blocks[cur_block_id as usize];
-                let file = File::open(&pkg_patch_stream_paths[current_block.patchid as usize]).expect("Error reading file");
-                let mut reader = BufReader::new(file);
-                reader.seek(SeekFrom::Start(current_block.offset as u64)).expect("Error seeking");
-                let mut block_buffer = vec![0; current_block.size as usize];
-                let result = reader.read(&mut block_buffer).expect("Error reading file");
-                if result != current_block.size as usize
-                {
-                    println!("Error reading file");
-                }
-                let mut _decrypt_buffer:Vec<u8> = vec![0u8; current_block.size as usize];
-                let mut _decomp_buffer:Vec<u8> = vec![0u8; BLOCK_SIZE as usize];
-                if current_block.bitflag & 0x2 != 0
-                {
-                    _decrypt_buffer = decrypt_block(&package, current_block, block_buffer);
-                }
-                else
-                {
-                    
-                    _decrypt_buffer = block_buffer
-                }
-                if current_block.bitflag & 0x1 != 0
-                {
-                    _decomp_buffer = decompress_block(current_block, &mut _decrypt_buffer);
-                }
-                else
-                {
-                    _decomp_buffer = _decrypt_buffer;
-                }
-                if cur_block_id == entry.startingblock
-                {
-                    let mut _cpy_size = 0;
-
-                    if cur_block_id == last_block_id
-                    {
-                        _cpy_size = entry.filesize;
-                    }
-                    else
-                    {
-                        _cpy_size = BLOCK_SIZE - entry.startingblockoffset;
-                    }
-                    file_buffer[0.._cpy_size as usize].copy_from_slice(&_decomp_buffer[entry.startingblockoffset as usize..entry.startingblockoffset as usize + _cpy_size as usize]);
-
-                    current_buffer_offset += _cpy_size as usize;
-                }
-                else if cur_block_id == last_block_id
-                {
-                    file_buffer[current_buffer_offset as usize..]
-                    .copy_from_slice(&_decomp_buffer[..(entry.filesize - current_buffer_offset as u32) as usize]);
-                }
-                else
-                {
-                    file_buffer[current_buffer_offset as usize..(current_buffer_offset + BLOCK_SIZE as usize) as usize].copy_from_slice(&_decomp_buffer[0..BLOCK_SIZE as usize]);
-                    current_buffer_offset += BLOCK_SIZE as usize;
-                }
-                reader.seek(SeekFrom::Start(0)).expect("Error seeking");
-                cur_block_id +=1;
-                _decomp_buffer.clear();
-            }
-            let mut cus_out = output_path_base.clone();
-            let mut _file_name:String = String::new();
-            let mut _ext = "";
-            if entry.numtype == 26 && entry.numsubtype == 7
-            {
-                _ext = "wem";
-                cus_out += "\\wem";
-                _file_name = hex_str_to_u32(entry.reference.clone()).to_string();
-                if extr_opts.hexid {
-                    _file_name = entry.reference.to_uppercase();
-                }
-            }
-            else if entry.numtype == 26 && entry.numsubtype == 6
-            {
-                _ext = "bnk";
-                cus_out.push_str("/bnk"); 
-                _file_name = format!("{}-{:04x}", package.package_id, i);
+                _decrypt_buffer = decrypt_block(&package, &mut cipher_ctx, current_block, block_buffer);
             }
             else
             {
-                _ext = "bin";
-                cus_out.push_str(format!("/unknown/{}/", entry.reference.to_uppercase()).as_str());
-                _file_name = get_hash_from_file(format!("{}-{:04x}", package.package_id, i));
-            }          
-            fs::create_dir_all(&cus_out).expect("Error creating directory");
-            let mut stream = BufWriter::new(File::create(format!("{}/{}.{}", cus_out, _file_name, _ext)).expect("Error creating file"));
-            stream.write_all(&file_buffer).expect("Error writing file");
-            stream.flush().unwrap();
-            file_buffer.clear();
+                
+                _decrypt_buffer = block_buffer
+            }
+            if current_block.bitflag & 0x1 != 0
+            {
+                _decomp_buffer = decompress_block(current_block, &mut _decrypt_buffer);
+            }
+            else
+            {
+                _decomp_buffer = _decrypt_buffer;
+            }
+            if cur_block_id == entry.startingblock
+            {
+                let mut _cpy_size = 0;
+
+                if cur_block_id == last_block_id
+                {
+                    _cpy_size = entry.filesize;
+                }
+                else
+                {
+                    _cpy_size = BLOCK_SIZE - entry.startingblockoffset;
+                }
+                file_buffer[0.._cpy_size as usize].copy_from_slice(&_decomp_buffer[entry.startingblockoffset as usize..entry.startingblockoffset as usize + _cpy_size as usize]);
+
+                current_buffer_offset += _cpy_size as usize;
+            }
+            else if cur_block_id == last_block_id
+            {
+                file_buffer[current_buffer_offset as usize..]
+                .copy_from_slice(&_decomp_buffer[..(entry.filesize - current_buffer_offset as u32) as usize]);
+            }
+            else
+            {
+                file_buffer[current_buffer_offset as usize..(current_buffer_offset + BLOCK_SIZE as usize) as usize].copy_from_slice(&_decomp_buffer[0..BLOCK_SIZE as usize]);
+                current_buffer_offset += BLOCK_SIZE as usize;
+            }
+            reader.seek(SeekFrom::Start(0)).expect("Error seeking");
+            cur_block_id +=1;
+            _decomp_buffer.clear();
         }
-    });
-    thread.join().unwrap();
+        let mut cus_out = extr_opts.output_path.to_owned();
+        cus_out += &format!("/{}/", &package.package_filename);
+        let mut _file_name:String = String::new();
+        let mut _ext = "";
+        if entry.numtype == 26 && entry.numsubtype == 7
+        {
+            _ext = "wem";
+            cus_out += "\\wem";
+            _file_name = hex_str_to_u32(entry.reference.clone()).to_string();
+            if extr_opts.hexid {
+                _file_name = entry.reference.to_uppercase();
+            }
+        }
+        else if entry.numtype == 26 && entry.numsubtype == 6
+        {
+            _ext = "bnk";
+            cus_out.push_str("/bnk"); 
+            _file_name = format!("{}-{:04x}", &package.package_id, i);
+        }
+        else
+        {
+            _ext = "bin";
+            cus_out.push_str(&format!("/unknown/{}-{}/", entry.numtype, entry.numsubtype));
+            _file_name = i.to_string() + "-" + &get_hash_from_file(format!("{}-{:04x}", &package.package_id, i));
+            _file_name += &format!("-{}-{}-{}", entry.reference, entry.numtype, entry.numsubtype);
+        }
+
+        //println!("{} {} {} {}", entry.reference, get_hash_from_file(format!("{}-{:04x}", package.package_id, i)), entry.numtype, entry.numsubtype);
+
+        fs::create_dir_all(&cus_out).expect("Error creating directory");
+        let mut stream = BufWriter::new(File::create(format!("{}/{}.{}", cus_out, _file_name, _ext)).expect("Error creating file"));
+        stream.write_all(&file_buffer).expect("Error writing file");
+        stream.flush().unwrap();
+        file_buffer.clear();
+        /*
+        });
+
+        tasks.push(task);
+        */
+    }
     
     if extr_opts.wavconv {
-        let wem_dir = output_path.clone() + "\\wem\\";
-        fs::create_dir_all(output_path + "\\wav").expect("Error creating directory");
+        let wem_dir = extr_opts.output_path.clone() + "\\wem\\";
+        fs::create_dir_all(extr_opts.output_path.clone() + "\\wav").expect("Error creating directory");
         let thread = thread::spawn(move || {
             for entry in fs::read_dir(wem_dir).unwrap() {
             let path_bufer = entry.unwrap().path();
@@ -346,7 +438,7 @@ fn extract_files(package: structs::Package, output_path_base: String, extr_opts:
 
 }
 
-fn decrypt_block(package: &structs::Package, block: &structs::Block, mut block_buffer: Vec<u8>) -> Vec<u8>
+fn decrypt_block(package: &Package, cipher_ctx: &mut CipherCtx, block: &structs::Block, mut block_buffer: Vec<u8>) -> Vec<u8>
 {
     let mut decrypt_buffer:Vec<u8> = vec![];
     let alt_key = &block.bitflag & 4 != 0;
@@ -360,11 +452,10 @@ fn decrypt_block(package: &structs::Package, block: &structs::Block, mut block_b
         _key = &package.aes_key;
     };
     let cipher = Cipher::aes_128_gcm();
-    let mut ctx = CipherCtx::new().unwrap();
-    ctx.decrypt_init(Some(cipher), Some(_key), Some(&package.nonce)).unwrap();
-    ctx.set_tag(&block.gcmtag).unwrap();
-    ctx.cipher_update_vec(&block_buffer, &mut decrypt_buffer).unwrap();
-    ctx.cipher_final_vec(&mut decrypt_buffer).expect_err("Failed finalizing decrypter");
+    cipher_ctx.decrypt_init(Some(cipher), Some(_key), Some(&package.nonce)).unwrap();
+    cipher_ctx.set_tag(&block.gcmtag).unwrap();
+    cipher_ctx.cipher_update_vec(&block_buffer, &mut decrypt_buffer).unwrap();
+    cipher_ctx.cipher_final_vec(&mut decrypt_buffer).expect_err("Failed finalizing decrypter");
 
     block_buffer.clear();
 

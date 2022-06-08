@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process;
+use std::sync::{Once};
 
+#[derive(Clone)]
 pub struct Entry {
     pub reference: String,
     pub numtype: u8,
@@ -10,6 +12,7 @@ pub struct Entry {
     pub filesize: u32
 }
 
+#[derive(Clone)]
 pub struct Header {
     pub pkgid: u16,
     pub patchid: u16,
@@ -21,6 +24,7 @@ pub struct Header {
     pub hash64_table_size: u32,
 }
 
+#[derive(Clone)]
 pub struct Block
 {
 	pub id: u32,
@@ -36,6 +40,7 @@ pub struct Package {
     pub packages_path: String,
     pub entries: Vec<Entry>,
     pub package_path: String,
+    pub package_filename : String,
     pub package_id: String,
     pub nonce: [u8; 12],
     pub blocks: Vec<Block>,
@@ -43,29 +48,33 @@ pub struct Package {
     pub aes_alt_key: [u8; 16],
 }
 
+#[derive(Clone)]
 pub struct ExtrOpts {
     pub hexid:bool,
     pub skip_non_audio:bool,
     pub wavconv:bool,
+    pub output_path:String
 }
 
 impl Package {
-    pub fn new(pkgspath:String, pkgid:String) -> Package {
+    pub fn new(pkgspath:&str, pkgid:&str) -> Package {
             let mut _exists:bool=true;
-            let packages_path = pkgspath;
-            let package_id = pkgid;
+            let packages_path = pkgspath.to_owned();
+            let package_id = pkgid.to_owned();
             _exists = Path::new(&packages_path).exists();
             if !_exists {
                 println!("Packages Path does not exist");
                 process::exit(1);
             }
             let package_path = get_latest_patch_id_path(&packages_path, &package_id);
+            let package_filename = package_path[package_path.rfind("/").unwrap() + 1..package_path.len() - 6].to_owned();//[package_path.rfind("/") ..package_path.len() - 4]
             let pkgp = package_path;
             Package {
                 header: Header::new(),
                 nonce: [0x84, 0xEA, 0x11, 0xC0, 0xAC, 0xAB, 0xFA, 0x20, 0x33, 0x11, 0x26, 0x99],
                 blocks: vec![Block::new()],
                 packages_path,
+                package_filename,
                 package_id,
                 package_path: pkgp,
                 entries: vec![Entry::new()],
@@ -76,36 +85,49 @@ impl Package {
 }
 
 fn get_latest_patch_id_path(packages_path: &str, package_id: &str) -> String {
+    static INIT: Once = Once::new();
+    static mut PATHS: Vec<String> = Vec::new();
+    INIT.call_once(||
+    {
+        for entry in std::fs::read_dir(packages_path).unwrap() {
+            unsafe {
+                PATHS.push(entry.unwrap().path().display().to_string());
+            }
+        }
+    });
+
+    let paths = unsafe
+    {
+        &PATHS
+    };
+
     let mut latest_patch_id:u16 = u16::MIN;
     let mut package_name:String = String::new();
-    let mut pa:String;
-    for entry in std::fs::read_dir(packages_path).unwrap() {
-        let entry = entry.unwrap();
-        let path:String = entry.path().display().to_string();
+    for path in paths {
         //println!("{}",path);     
         if path.contains(package_id) {
             //println!("Match: {}",path);
-            let patch_str = &path[path.len()-5..];
-            let patch_str = &patch_str[0..1];
+            let patch_str = &path[path.len()-5..path.len()-4];
             //println!("{}",&path[path.len()-5..]);
             //println!("{}",patch_str);
             let patch_id:u16 = patch_str.parse::<u16>().unwrap();
-            if patch_id > latest_patch_id {
+            if patch_id > latest_patch_id || latest_patch_id == 0 {
                 latest_patch_id = patch_id;
                 let path2 = path.replace('\\', "/");
-                pa = path2.clone().to_owned();
-                package_name = pa.to_string()[0..pa.to_string().len()-6].to_string();
+                package_name = path2[path2.rfind('/').unwrap() + 1..path2.len()-6].to_string();
                 //println!("{package_name}");
+                /*
                 let pos = package_name.rfind('/');
                 let val = package_name.len()-pos.unwrap();
                 package_name = package_name[pos.unwrap()..].to_string();
                 package_name = package_name[..val].to_string();
+                */
                 //println!("Latest Patch Id: {}", latest_patch_id);
                 //println!("Latest Patch Path: {}", package_name);
             }
         }
     }
-    println!("{packages_path}/{package_name}_{latest_patch_id}.pkg");
+    //println!("{packages_path}/{package_name}_{latest_patch_id}.pkg");
     return format!("{}/{}_{}.pkg", packages_path, package_name, &latest_patch_id.to_string());
 }
 
@@ -171,6 +193,7 @@ impl ExtrOpts {
             hexid: false,
             skip_non_audio: true,
             wavconv: false,
+            output_path: String::new()
         }
     }
 }
